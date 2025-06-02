@@ -15,16 +15,30 @@ defmodule TailwindFormatter do
     [sigils: [:H], extensions: [".heex"]]
   end
 
-  def format(contents, _opts) do
+  @default_line_length 98
+  # Module.get_attribute(Phoenix.LiveView.HTMLFormatter, :default_line_length)
+
+  def format(contents, opts) do
+    max_line_length =
+      opts[:heex_line_length] || opts[:line_length] || @default_line_length
+
     contents
     |> HEExTokenizer.tokenize()
     |> Enum.reduce([contents], fn
-      {elt, _name, attrs, _meta}, contents
+      {elt, _name, attrs, elt_meta}, contents
       when elt in [:tag, :local_component, :remote_component] ->
         Enum.reduce(attrs, contents, fn
-          {"class", class_attr, _meta}, [remainder | acc] ->
+          {"class", class_attr, meta}, [remainder | acc] ->
             [attr, remainder] = String.split(remainder, old_classes(class_attr), parts: 2)
-            [remainder, sort_classes(class_attr), attr | acc]
+
+            indent =
+              if elt_meta.line === meta.line do
+                "\n" <> String.duplicate(" ", elt_meta.column + 1)
+              else
+                "\n" <> String.duplicate(" ", meta.column + 1)
+              end
+
+            [remainder, sort_classes(class_attr, {indent, max_line_length}), attr | acc]
 
           _, contents ->
             contents
@@ -38,25 +52,29 @@ defmodule TailwindFormatter do
   end
 
   defp old_classes({_type, classes, _meta}), do: classes
-  defp sort_classes({:string, classes, _meta}), do: sort(classes)
+  defp sort_classes({:string, classes, _meta}, indent), do: sort(classes, indent)
 
-  defp sort_classes({:expr, expr_class, _meta}) do
+  defp sort_classes({:expr, expr_class, _meta}, indent) do
     expr_class
     |> Code.string_to_quoted!(literal_encoder: &{:ok, {:__block__, &2, [&1]}})
-    |> sort_expr()
+    |> sort_expr(indent)
     |> Code.quoted_to_algebra()
     |> Inspect.Algebra.format(:infinity)
     |> IO.iodata_to_binary()
   end
 
-  defp sort_expr({:<<>>, meta, children}), do: {:<<>>, meta, handle_interpolation(children)}
-  defp sort_expr({a, b, c}), do: {sort_expr(a), sort_expr(b), sort_expr(c)}
-  defp sort_expr({a, b}), do: {sort_expr(a), sort_expr(b)}
-  defp sort_expr(list) when is_list(list), do: Enum.map(list, &sort_expr/1)
-  defp sort_expr(text) when is_binary(text), do: sort(text)
-  defp sort_expr(node), do: node
+  defp sort_expr({:<<>>, meta, children}, indent),
+    do: {:<<>>, meta, handle_interpolation(children, indent)}
 
-  defp handle_interpolation(children) do
+  defp sort_expr({a, b, c}, indent),
+    do: {sort_expr(a, indent), sort_expr(b, indent), sort_expr(c, indent)}
+
+  defp sort_expr({a, b}, indent), do: {sort_expr(a, indent), sort_expr(b, indent)}
+  defp sort_expr(list, indent) when is_list(list), do: Enum.map(list, &sort_expr(&1, indent))
+  defp sort_expr(text, indent) when is_binary(text), do: sort(text, indent)
+  defp sort_expr(node, _indent), do: node
+
+  defp handle_interpolation(children, indent) do
     {classes_with_placeholders, {placeholder_map, _index}} =
       Enum.map_reduce(children, {%{}, 0}, fn
         str, acc when is_binary(str) ->
@@ -64,7 +82,7 @@ defmodule TailwindFormatter do
 
         node, {placeholder_map, index} ->
           {"#{@placeholder}#{index}#{@placeholder}",
-           {Map.put(placeholder_map, "#{index}", sort_expr(node)), index + 1}}
+           {Map.put(placeholder_map, "#{index}", sort_expr(node, indent)), index + 1}}
       end)
 
     classes_with_placeholders
@@ -73,7 +91,7 @@ defmodule TailwindFormatter do
         do: acc <> class,
         else: "#{acc} #{class}"
     end)
-    |> sort()
+    |> sort(indent)
     |> String.split()
     |> weave_in_code(placeholder_map)
   end
@@ -103,17 +121,43 @@ defmodule TailwindFormatter do
     end)
   end
 
-  defp sort(classes) when is_binary(classes) do
+  defp sort(classes, {indent, max_line_length}) when is_binary(classes) do
     leading_space = if classes =~ ~r/\A\s/, do: " "
     trailing_space = if classes =~ ~r/\s\z/, do: " "
+    max_line_length = max_line_length - String.length(indent)
 
     classes =
       classes
       |> sort_variant_chains()
       |> sort()
-      |> Enum.join(" ")
+      |> Enum.reduce({[], 0}, fn
+        class, {[], _current_line_length} ->
+          {[[class]], String.length(class)}
 
-    Enum.join([leading_space, classes, trailing_space])
+        class, {[current_line | rest], current_line_length} ->
+          class_length = String.length(class)
+          line_length = current_line_length + 1 + class_length
+
+          if line_length <= max_line_length do
+            {[current_line ++ [class] | rest], line_length}
+          else
+            {[[class] | [current_line | rest]], class_length}
+          end
+      end)
+      |> elem(0)
+      |> Enum.reverse()
+      |> Enum.map(&(&1 |> Enum.join(" ")))
+
+    case classes do
+      [] ->
+        ""
+
+      [single_line] ->
+        Enum.join([leading_space, single_line, trailing_space])
+
+      multiple_lines ->
+        Enum.join([indent, Enum.join(multiple_lines, indent), String.slice(indent, 0..-3//1)])
+    end
   end
 
   defp sort([]), do: []
